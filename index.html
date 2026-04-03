@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Maximus Pro – Free Plan</title>
+<style>
+  body {
+    background: #000;
+    color: #00eaff;
+    font-family: Arial, sans-serif;
+    text-align: center;
+    padding: 40px;
+  }
+  h1 {
+    font-size: 3rem;
+    text-shadow: 0 0 15px #00eaff;
+    margin-bottom: 10px;
+  }
+  h2 {
+    font-size: 1rem;
+    color: #888;
+    margin-top: 0;
+    margin-bottom: 25px;
+  }
+  #prompt, #length {
+    padding: 12px;
+    font-size: 1.1rem;
+    border-radius: 10px;
+    border: 2px solid #00eaff;
+    background: #0a0a0a;
+    color: #00eaff;
+    outline: none;
+    box-shadow: 0 0 10px #00eaff;
+    margin: 5px;
+  }
+  #prompt { width: 60%; }
+  #length { width: 140px; }
+  button {
+    background: #00eaff;
+    border: none;
+    padding: 15px 30px;
+    margin: 15px;
+    font-size: 1.1rem;
+    cursor: pointer;
+    border-radius: 8px;
+    color: #000;
+    font-weight: bold;
+    box-shadow: 0 0 10px #00eaff;
+  }
+  button:disabled {
+    background: #333;
+    color: #777;
+    box-shadow: none;
+    cursor: default;
+  }
+  canvas {
+    width: 100%;
+    height: 200px;
+    background: #111;
+    border: 2px solid #00eaff;
+    margin-top: 20px;
+    border-radius: 10px;
+  }
+  #status {
+    margin-top: 10px;
+    font-size: 0.9rem;
+    color: #aaa;
+  }
+  #planInfo {
+    margin-top: 5px;
+    font-size: 0.85rem;
+    color: #00eaff;
+  }
+</style>
+</head>
+<body>
+
+<h1>Maximus Pro</h1>
+<h2>Free Plan – Full Power for 30 Days</h2>
+
+<input id="prompt" placeholder="Describe your track (genre, mood, structure)..." />
+<input id="length" type="number" min="10" max="3600" placeholder="Length (sec)" />
+
+<br>
+
+<button id="generateBtn">Generate Track</button>
+<button id="downloadBtn" disabled>Download WAV</button>
+
+<div id="status">Idle.</div>
+<div id="planInfo"></div>
+
+<canvas id="waveform"></canvas>
+
+<audio id="player" controls></audio>
+
+<script>
+/* ---------- Pro config ---------- */
+const MAX_LENGTH_PRO = 3600;              // hard cap in seconds
+const LONG_RENDER_THRESHOLD = 600;        // above this is "Pro" length
+const LONG_RENDER_COOLDOWN_MS = 60_000;   // 60s cooldown between long renders
+const MAX_PRO_SONGS_PER_DAY = 30;         // max long songs per day
+
+/* ---------- Free plan config ---------- */
+const FREE_PLAN_DAYS = 30;                // free Pro duration
+
+let lastLongRenderAt = null;
+
+const statusEl = document.getElementById("status");
+const planInfoEl = document.getElementById("planInfo");
+const generateBtn = document.getElementById("generateBtn");
+const downloadBtn = document.getElementById("downloadBtn");
+
+/* ---------- Free plan helpers ---------- */
+function getFreePlanState() {
+  const raw = localStorage.getItem("maximusFreePlan");
+  if (!raw) {
+    const now = Date.now();
+    const state = { start: now };
+    localStorage.setItem("maximusFreePlan", JSON.stringify(state));
+    return state;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const now = Date.now();
+    const state = { start: now };
+    localStorage.setItem("maximusFreePlan", JSON.stringify(state));
+    return state;
+  }
+}
+
+function getFreePlanDaysLeft() {
+  const state = getFreePlanState();
+  const now = Date.now();
+  const elapsedMs = now - state.start;
+  const elapsedDays = elapsedMs / (1000 * 60 * 60 * 24);
+  const remaining = FREE_PLAN_DAYS - elapsedDays;
+  return Math.max(0, remaining);
+}
+
+function isFreePlanActive() {
+  return getFreePlanDaysLeft() > 0;
+}
+
+function updatePlanInfo() {
+  const remaining = getFreePlanDaysLeft();
+  if (remaining > 0) {
+    const daysLeft = Math.ceil(remaining);
+    planInfoEl.textContent = `Free Pro plan active: ~${daysLeft} day(s) left • No rate limits.`;
+  } else {
+    planInfoEl.textContent = `Free Pro plan ended. You are now on the normal Pro tier (30 long songs/day).`;
+  }
+}
+
+/* ---------- Daily limit helpers (for post‑free plan) ---------- */
+function getTodayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`;
+}
+
+function loadDailyCount() {
+  const key = getTodayKey();
+  const saved = JSON.parse(localStorage.getItem("maximusProDaily") || "{}");
+  if (saved.date !== key) {
+    const fresh = { date: key, count: 0 };
+    localStorage.setItem("maximusProDaily", JSON.stringify(fresh));
+    return fresh;
+  }
+  return saved;
+}
+
+function getDailyCount() {
+  return loadDailyCount().count;
+}
+
+function incrementDailyCount() {
+  const saved = loadDailyCount();
+  saved.count++;
+  localStorage.setItem("maximusProDaily", JSON.stringify(saved));
+}
+
+/* ---------- WAV PCM RECORDER ---------- */
+class PCMRecorder {
+  constructor(sampleRate) {
+    this.sampleRate = sampleRate;
+    this.buffers = [];
+    this.recording = false;
+  }
+  addSamples(samples) {
+    if (!this.recording) return;
+    this.buffers.push(new Float32Array(samples));
+  }
+  start() {
+    this.buffers = [];
+    this.recording = true;
+  }
+  stop() {
+    this.recording = false;
+    let totalLength = this.buffers.reduce((s, b) => s + b.length, 0);
+    let merged = new Float32Array(totalLength);
+    let offset = 0;
+    for (const b of this.buffers) {
+      merged.set(b, offset);
+      offset += b.length;
+    }
+    const wav = this.encodeWAV(merged);
+    return new Blob([wav], { type: "audio/wav" });
+  }
+  encodeWAV(samples) {
+    const numChannels = 1;
+    const bytesPerSample = 2;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = this.sampleRate * blockAlign;
+    const buffer = new ArrayBuffer(44 + samples.length * bytesPerSample);
+    const view = new DataView(buffer);
+
+    this.writeString(view, 0, "RIFF");
+    view.setUint32(4, 36 + samples.length * bytesPerSample, true);
+    this.writeString(view, 8, "WAVE");
+
+    this.writeString(view, 12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, this.sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bytesPerSample * 8, true);
+
+    this.writeString(view, 36, "data");
+    view.setUint32(40, samples.length * bytesPerSample, true);
+
+    let offset = 44;
+    for (let i = 0; i < samples.length; i++) {
+      let s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(offset, s * 0x7fff, true);
+      offset += 2;
+    }
+    return buffer;
+  }
+  writeString(view, offset, str) {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  }
+}
+
+/* ---------- Globals ---------- */
+let audioCtx = null;
+let analyser = null;
+let maximusNode = null;
+let recorder = null;
+let scriptNode = null;
+let recordedBlob = null;
+
+const canvas = document.getElementById("waveform");
+const cctx = canvas.getContext("2d");
+
+/* ---------- Audio context + waveform ---------- */
+function ensureAudioContext() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+  }
+}
+
+function drawWaveform() {
+  requestAnimationFrame(drawWaveform);
+  if (!analyser) return;
+  let data = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(data);
+
+  cctx.fillStyle = "#111";
+  cctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  cctx.lineWidth = 2;
+  cctx.strokeStyle = "#00eaff";
+  cctx.beginPath();
+
+  let slice = canvas.width / data.length;
+  let x = 0;
+  for (let i = 0; i < data.length; i++) {
+    let v = data[i] / 128.0;
+    let y = (v * canvas.height) / 2;
+    if (i === 0) cctx.moveTo(x, y);
+    else cctx.lineTo(x, y);
+    x += slice;
+  }
+  cctx.stroke();
+}
+drawWaveform();
+
+/* ---------- Style parser ---------- */
+function parseStyle(promptText, lengthOverride) {
+  const text = (promptText || "").toLowerCase();
+  const style = {
+    genres: [],
+    mood: "neutral",
+    energy: "medium",
+    instruments: [],
+    vocals: false,
+    structure: [],
+    bpm: 120,
+    lengthSeconds: 60
+  };
+
+  const genreMap = {
+    "trap": "trap",
+    "dnb": "drum and bass",
+    "drum and bass": "drum and bass",
+    "edm": "edm",
+    "house": "house",
+    "ambient": "ambient",
+    "chill": "ambient",
+    "hip hop": "hip hop",
+    "boom bap": "boom bap",
+    "synthwave": "synthwave",
+    "lofi": "lofi",
+    "dubstep": "dubstep",
+    "drill": "drill"
+  };
+  for (const key in genreMap) {
+    if (text.includes(key)) style.genres.push(genreMap[key]);
+  }
+  if (style.genres.length === 0) style.genres.push("generic");
+
+  if (text.includes("dark")) style.mood = "dark";
+  if (text.includes("bright")) style.mood = "bright";
+  if (text.includes("sad")) style.mood = "sad";
+  if (text.includes("happy")) style.mood = "happy";
+  if (text.includes("cinematic")) style.mood = "cinematic";
+  if (text.includes("dreamy")) style.mood = "dreamy";
+
+  if (text.includes("high energy") || text.includes("hype") || text.includes("fast")) style.energy = "high";
+  if (text.includes("low energy") || text.includes("chill") || text.includes("slow")) style.energy = "low";
+
+  const instrumentKeywords = [
+    "deep bass", "bass", "808", "reese", "sub",
+    "pads", "pad", "lead", "melody", "synth", "bells", "piano", "keys", "atmospheric"
+  ];
+  instrumentKeywords.forEach(inst => {
+    if (text.includes(inst)) style.instruments.push(inst);
+  });
+
+  if (text.includes("vocal") || text.includes("rap") || text.includes("singer") || text.includes("space for vocals"))
+    style.vocals = true;
+
+  const structureKeywords = ["intro", "build", "drop", "verse", "chorus", "hook", "bridge", "outro"];
+  structureKeywords.forEach(part => {
+    if (text.includes(part)) style.structure.push(part);
+  });
+  if (style.structure.length === 0) {
+    style.structure = ["intro", "build", "drop", "verse", "chorus", "bridge", "outro"];
+  }
+
+  function pickBpm(genres) {
+    if (genres.includes("drum and bass")) return 170;
+    if (genres.includes("dubstep")) return 140;
+    if (genres.includes("trap") || genres.includes("drill")) return 140;
+    if (genres.includes("edm") || genres.includes("house")) return 128;
+    if (genres.includes("hip hop") || genres.includes("boom bap")) return 90;
+    if (genres.includes("lofi")) return 80;
+    if (genres.includes("ambient")) return 75;
+    return 120;
+  }
+  style.bpm = pickBpm(style.genres);
+  if (style.energy === "high") style.bpm += 5;
+  if (style.energy === "low") style.bpm -= 5;
+
+  if (!isNaN(lengthOverride) && lengthOverride > 5 && lengthOverride <= MAX_LENGTH_PRO)
+    style.lengthSeconds = lengthOverride;
+
+  const lengthMatch = text.match(/(\d+)\s*(seconds|second|sec|minutes|minute|min)/);
+  if (lengthMatch) {
+    let num = parseInt(lengthMatch[1]);
+    if (lengthMatch[2].includes("min")) num *= 60;
+    style.lengthSeconds = Math.max(10, Math.min(num, MAX_LENGTH_PRO));
+  }
+
+  if (text.includes("short")) style.lengthSeconds = 30;
+  if (text.includes("long")) style.lengthSeconds = 120;
+  if (text.includes("full song") || text.includes("full track")) style.lengthSeconds = 180;
+
+  return style;
+}
+
+/* ---------- Worklet code (inline) ---------- */
+const workletCode = `
+function getSectionAtTime(timeSeconds, style) {
+  const bpm = style.bpm;
+  const secondsPerBeat = 60 / bpm;
+  const beatsPerBar = 4;
+  const barsPerSection = 8;
+  const sectionLength = secondsPerBeat * beatsPerBar * barsPerSection;
+  const index = Math.floor(timeSeconds / sectionLength);
+  const loopedIndex = index % style.structure.length;
+  const name = style.structure[loopedIndex];
+  const evolution = Math.min(1, timeSeconds / (style.lengthSeconds || 180));
+  return { name, evolution, index: loopedIndex };
+}
+
+class MaximusProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.time = 0;
+    this.style = null;
+    this.port.onmessage = (event) => {
+      const msg = event.data;
+      if (msg.type === "init") {
+        this.style = msg.style;
+        this.time = 0;
+      }
+      if (msg.type === "stop") {
+        this.style = null;
+      }
+    };
+  }
+  hasGenre(g) {
+    return this.style && this.style.genres.includes(g);
+  }
+  process(inputs, outputs, parameters) {
+    const output = outputs[0];
+    const channel = output[0];
+    if (!this.style) {
+      for (let i = 0; i < channel.length; i++) channel[i] = 0;
+      return true;
+    }
+    const style = this.style;
+    const sr = sampleRate;
+    const bpm = style.bpm;
+    const secondsPerBeat = 60 / bpm;
+    const beatsPerBar = 4;
+    const barLength = secondsPerBeat * beatsPerBar;
+
+    for (let i = 0; i < channel.length; i++) {
+      const t = this.time;
+      const beat = t / secondsPerBeat;
+      const beatInBar = beat % beatsPerBar;
+      const section = getSectionAtTime(t, style);
+      const sectionName = section.name;
+
+      let drums = 0, bass = 0, synth = 0, vocal = 0;
+      let kick = 0, snare = 0, hat = 0;
+
+      if (this.hasGenre("drum and bass")) {
+        if (Math.abs(beatInBar - 0) < 0.04 || Math.abs(beatInBar - 1.5) < 0.04)
+          kick = Math.sin(2 * Math.PI * 60 * t) * Math.exp(-(t % secondsPerBeat) * 22);
+        if (Math.abs(beatInBar - 1) < 0.04 || Math.abs(beatInBar - 2.5) < 0.04)
+          snare = (Math.random() * 2 - 1) * 0.5 * Math.exp(-(t % secondsPerBeat) * 26);
+        if (Math.floor(beat * 4) % 2 === 0)
+          hat = (Math.random() * 2 - 1) * 0.16;
+      }
+      if (this.hasGenre("trap") || this.hasGenre("drill")) {
+        if (Math.abs(beatInBar - 0) < 0.05 || Math.abs(beatInBar - 2) < 0.05)
+          kick += Math.sin(2 * Math.PI * 50 * t) * Math.exp(-(t % secondsPerBeat) * 18);
+        if (Math.abs(beatInBar - 1) < 0.05 || Math.abs(beatInBar - 3) < 0.05)
+          snare += (Math.random() * 2 - 1) * 0.4 * Math.exp(-(t % secondsPerBeat) * 22);
+        if (Math.floor(beat * 8) % 2 === 0)
+          hat += (Math.random() * 2 - 1) * 0.12;
+      }
+      if (this.hasGenre("edm") || this.hasGenre("house")) {
+        if (Math.abs(beatInBar - 0) < 0.05 || Math.abs(beatInBar - 1) < 0.05 ||
+            Math.abs(beatInBar - 2) < 0.05 || Math.abs(beatInBar - 3) < 0.05)
+          kick += Math.sin(2 * Math.PI * 60 * t) * Math.exp(-(t % secondsPerBeat) * 18);
+        if (Math.abs(beatInBar - 1.5) < 0.05 || Math.abs(beatInBar - 3.5) < 0.05)
+          snare += (Math.random() * 2 - 1) * 0.35 * Math.exp(-(t % secondsPerBeat) * 20);
+        if (Math.floor(beat * 4) % 2 === 0)
+          hat += (Math.random() * 2 - 1) * 0.1;
+      }
+      if (this.hasGenre("ambient") || this.hasGenre("lofi")) {
+        if (Math.abs(beatInBar - 0) < 0.05)
+          kick += Math.sin(2 * Math.PI * 40 * t) * Math.exp(-(t % secondsPerBeat) * 8);
+        if (Math.abs(beatInBar - 2) < 0.05)
+          snare += (Math.random() * 2 - 1) * 0.2 * Math.exp(-(t % secondsPerBeat) * 10);
+        if (Math.floor(beat * 2) % 2 === 0)
+          hat += (Math.random() * 2 - 1) * 0.05;
+      }
+      if (this.hasGenre("generic")) {
+        if (Math.abs(beatInBar - 0) < 0.05 || Math.abs(beatInBar - 2) < 0.05)
+          kick += Math.sin(2 * Math.PI * 60 * t) * Math.exp(-(t % secondsPerBeat) * 15);
+        if (Math.abs(beatInBar - 1) < 0.05 || Math.abs(beatInBar - 3) < 0.05)
+          snare += (Math.random() * 2 - 1) * 0.3 * Math.exp(-(t % secondsPerBeat) * 18);
+        if (Math.floor(beat * 4) % 2 === 0)
+          hat += (Math.random() * 2 - 1) * 0.1;
+      }
+
+      drums = kick + snare + hat;
+
+      let baseFreq = 55;
+      if (this.hasGenre("drum and bass")) baseFreq = 80;
+      if (this.hasGenre("trap") || this.hasGenre("drill")) baseFreq = 45;
+      if (this.hasGenre("edm") || this.hasGenre("house")) baseFreq = 60;
+      let bassEnv = Math.max(0, Math.sin(Math.PI * (beatInBar / beatsPerBar)));
+      bass = Math.sin(2 * Math.PI * baseFreq * t) * bassEnv * 0.4;
+
+      let synthFreq = 220;
+      let mod = 1 + 0.1 * Math.sin(2 * Math.PI * (t / (barLength * 4)));
+      synth = Math.sin(2 * Math.PI * synthFreq * mod * t) * 0.4;
+
+      if (style.vocals && (sectionName.includes("verse") || sectionName.includes("chorus"))) {
+        let vowelFreq = 300 + 200 * Math.sin(t * 0.5);
+        let f1 = Math.sin(2 * Math.PI * vowelFreq * t);
+        let f2 = Math.sin(2 * Math.PI * vowelFreq * 2.5 * t);
+        vocal = (f1 * 0.4 + f2 * 0.2) * 0.3;
+      }
+
+      let sample = drums + bass + synth + vocal;
+      sample *= 0.6;
+      channel[i] = sample;
+      this.time += 1 / sr;
+    }
+    return true;
+  }
+}
+registerProcessor("maximus-processor", MaximusProcessor);
+`;
+
+/* ---------- Start Maximus (Free plan + Pro rules) ---------- */
+async function startMaximus(promptText, lengthOverride) {
+  ensureAudioContext();
+
+  let requestedLength = parseFloat(lengthOverride);
+  if (isNaN(requestedLength)) requestedLength = 60;
+  requestedLength = Math.max(10, Math.min(requestedLength, MAX_LENGTH_PRO));
+
+  const freeActive = isFreePlanActive();
+  const now = Date.now();
+  const isLong = requestedLength >= LONG_RENDER_THRESHOLD;
+
+  if (!freeActive) {
+    const dailyCount = getDailyCount();
+    if (isLong && dailyCount >= MAX_PRO_SONGS_PER_DAY) {
+      statusEl.textContent = "Maximus Pro limit reached for today. Switching to normal mode (<=600s).";
+      requestedLength = Math.min(requestedLength, 600);
+    }
+
+    if (isLong && dailyCount < MAX_PRO_SONGS_PER_DAY) {
+      if (lastLongRenderAt !== null) {
+        const elapsed = now - lastLongRenderAt;
+        if (elapsed < LONG_RENDER_COOLDOWN_MS) {
+          const remaining = Math.ceil((LONG_RENDER_COOLDOWN_MS - elapsed) / 1000);
+          statusEl.textContent = `Cooldown: wait ${remaining}s before another long render.`;
+          return;
+        }
+      }
+      lastLongRenderAt = now;
+      incrementDailyCount();
+    }
+  }
+
+  const style = parseStyle(promptText, requestedLength);
+
+  const blob = new Blob([workletCode], { type: "application/javascript" });
+  const url = URL.createObjectURL(blob);
+  if (!startMaximus.workletLoaded) {
+    await audioCtx.audioWorklet.addModule(url);
+    startMaximus.workletLoaded = true;
+  }
+
+  if (maximusNode) {
+    maximusNode.port.postMessage({ type: "stop" });
+    maximusNode.disconnect();
+    maximusNode = null;
+  }
+
+  maximusNode = new AudioWorkletNode(audioCtx, "maximus-processor", {
+    numberOfInputs: 0,
+    numberOfOutputs: 1,
+    outputChannelCount: [1]
+  });
+
+  maximusNode.port.postMessage({ type: "init", style });
+
+  maximusNode.connect(analyser);
+  analyser.connect(audioCtx.destination);
+
+  recorder = new PCMRecorder(audioCtx.sampleRate);
+
+  if (scriptNode) {
+    scriptNode.disconnect();
+    scriptNode = null;
+  }
+
+  scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
+  maximusNode.connect(scriptNode);
+  scriptNode.connect(audioCtx.destination);
+  scriptNode.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    recorder.addSamples(input);
+  };
+
+  recorder.start();
+  recordedBlob = null;
+  downloadBtn.disabled = true;
+
+  if (freeActive) {
+    statusEl.textContent = `Free Pro: generating ~${style.lengthSeconds}s track (${style.genres.join(", ")} @ ${style.bpm} BPM)...`;
+  } else {
+    statusEl.textContent = `Pro (limited): generating ~${style.lengthSeconds}s track (${style.genres.join(", ")} @ ${style.bpm} BPM)...`;
+  }
+
+  updatePlanInfo();
+}
+
+/* ---------- UI hooks ---------- */
+generateBtn.onclick = () => {
+  const promptText = document.getElementById("prompt").value || "";
+  const lengthVal = document.getElementById("length").value;
+  startMaximus(promptText, lengthVal);
+};
+
+downloadBtn.onclick = () => {
+  if (!recorder) return;
+  const blob = recorder.stop();
+  recordedBlob = blob;
+  const url = URL.createObjectURL(blob);
+  const player = document.getElementById("player");
+  player.src = url;
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "maximus-pro.wav";
+  a.click();
+
+  statusEl.textContent = "Render complete. WAV downloaded.";
+};
+
+/* ---------- Init ---------- */
+updatePlanInfo();
+</script>
+
+</body>
+</html>
