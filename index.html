@@ -94,43 +94,44 @@
 <audio id="player" controls></audio>
 
 <script>
-/* ---------- Pro config ---------- */
-const MAX_LENGTH_PRO = 3600;              // hard cap in seconds
-const LONG_RENDER_THRESHOLD = 600;        // above this is "Pro" length
-const LONG_RENDER_COOLDOWN_MS = 60_000;   // 60s cooldown between long renders
-const MAX_PRO_SONGS_PER_DAY = 30;         // max long songs per day
-
 /* ---------- Free plan config ---------- */
-const FREE_PLAN_DAYS = 30;                // free Pro duration
-
-let lastLongRenderAt = null;
+const MAX_LENGTH_PRO = 3600;          // max seconds
+const FREE_PLAN_DAYS = 30;           // 30-day free plan
 
 const statusEl = document.getElementById("status");
 const planInfoEl = document.getElementById("planInfo");
 const generateBtn = document.getElementById("generateBtn");
 const downloadBtn = document.getElementById("downloadBtn");
 
+/* ---------- URL-triggered Free Plan Reset ---------- */
+function checkURLForFreePlanReset() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("startFreePlan") === "1") {
+    const now = Date.now();
+    const newState = { start: now };
+    localStorage.setItem("maximusFreePlan", JSON.stringify(newState));
+    console.log("Free plan reset via URL.");
+  }
+}
+checkURLForFreePlanReset();
+
 /* ---------- Free plan helpers ---------- */
 function getFreePlanState() {
   const raw = localStorage.getItem("maximusFreePlan");
   if (!raw) {
-    const now = Date.now();
-    const state = { start: now };
-    localStorage.setItem("maximusFreePlan", JSON.stringify(state));
-    return state;
+    // If never set, don't auto-start; require button
+    return null;
   }
   try {
     return JSON.parse(raw);
   } catch {
-    const now = Date.now();
-    const state = { start: now };
-    localStorage.setItem("maximusFreePlan", JSON.stringify(state));
-    return state;
+    return null;
   }
 }
 
 function getFreePlanDaysLeft() {
   const state = getFreePlanState();
+  if (!state) return 0;
   const now = Date.now();
   const elapsedMs = now - state.start;
   const elapsedDays = elapsedMs / (1000 * 60 * 60 * 24);
@@ -143,43 +144,21 @@ function isFreePlanActive() {
 }
 
 function updatePlanInfo() {
+  const state = getFreePlanState();
   const remaining = getFreePlanDaysLeft();
+  if (!state) {
+    planInfoEl.textContent = "Free plan not started. Go back and press the Start Free Plan button.";
+    return;
+  }
   if (remaining > 0) {
     const daysLeft = Math.ceil(remaining);
-    planInfoEl.textContent = `Free Pro plan active: ~${daysLeft} day(s) left • No rate limits.`;
+    planInfoEl.textContent = `Free Pro plan active: ~${daysLeft} day(s) left • No limits.`;
   } else {
-    planInfoEl.textContent = `Free Pro plan ended. You are now on the normal Pro tier (30 long songs/day).`;
+    planInfoEl.textContent = "Free plan expired. Go back to the main site and press Start Free Plan again.";
   }
 }
 
-/* ---------- Daily limit helpers (for post‑free plan) ---------- */
-function getTodayKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`;
-}
-
-function loadDailyCount() {
-  const key = getTodayKey();
-  const saved = JSON.parse(localStorage.getItem("maximusProDaily") || "{}");
-  if (saved.date !== key) {
-    const fresh = { date: key, count: 0 };
-    localStorage.setItem("maximusProDaily", JSON.stringify(fresh));
-    return fresh;
-  }
-  return saved;
-}
-
-function getDailyCount() {
-  return loadDailyCount().count;
-}
-
-function incrementDailyCount() {
-  const saved = loadDailyCount();
-  saved.count++;
-  localStorage.setItem("maximusProDaily", JSON.stringify(saved));
-}
-
-/* ---------- WAV PCM RECORDER ---------- */
+/* ---------- WAV Recorder ---------- */
 class PCMRecorder {
   constructor(sampleRate) {
     this.sampleRate = sampleRate;
@@ -245,7 +224,7 @@ class PCMRecorder {
   }
 }
 
-/* ---------- Globals ---------- */
+/* ---------- Audio + waveform ---------- */
 let audioCtx = null;
 let analyser = null;
 let maximusNode = null;
@@ -256,7 +235,6 @@ let recordedBlob = null;
 const canvas = document.getElementById("waveform");
 const cctx = canvas.getContext("2d");
 
-/* ---------- Audio context + waveform ---------- */
 function ensureAudioContext() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -385,7 +363,7 @@ function parseStyle(promptText, lengthOverride) {
   return style;
 }
 
-/* ---------- Worklet code (inline) ---------- */
+/* ---------- Worklet code ---------- */
 const workletCode = `
 function getSectionAtTime(timeSeconds, style) {
   const bpm = style.bpm;
@@ -516,38 +494,22 @@ class MaximusProcessor extends AudioWorkletProcessor {
 registerProcessor("maximus-processor", MaximusProcessor);
 `;
 
-/* ---------- Start Maximus (Free plan + Pro rules) ---------- */
+/* ---------- Start Maximus (Free Plan Gate) ---------- */
 async function startMaximus(promptText, lengthOverride) {
+  const remaining = getFreePlanDaysLeft();
+  const state = getFreePlanState();
+
+  if (!state || remaining <= 0) {
+    statusEl.textContent = "Free plan expired or not started. Go back and press Start Free Plan on the main site.";
+    updatePlanInfo();
+    return;
+  }
+
   ensureAudioContext();
 
   let requestedLength = parseFloat(lengthOverride);
   if (isNaN(requestedLength)) requestedLength = 60;
   requestedLength = Math.max(10, Math.min(requestedLength, MAX_LENGTH_PRO));
-
-  const freeActive = isFreePlanActive();
-  const now = Date.now();
-  const isLong = requestedLength >= LONG_RENDER_THRESHOLD;
-
-  if (!freeActive) {
-    const dailyCount = getDailyCount();
-    if (isLong && dailyCount >= MAX_PRO_SONGS_PER_DAY) {
-      statusEl.textContent = "Maximus Pro limit reached for today. Switching to normal mode (<=600s).";
-      requestedLength = Math.min(requestedLength, 600);
-    }
-
-    if (isLong && dailyCount < MAX_PRO_SONGS_PER_DAY) {
-      if (lastLongRenderAt !== null) {
-        const elapsed = now - lastLongRenderAt;
-        if (elapsed < LONG_RENDER_COOLDOWN_MS) {
-          const remaining = Math.ceil((LONG_RENDER_COOLDOWN_MS - elapsed) / 1000);
-          statusEl.textContent = `Cooldown: wait ${remaining}s before another long render.`;
-          return;
-        }
-      }
-      lastLongRenderAt = now;
-      incrementDailyCount();
-    }
-  }
 
   const style = parseStyle(promptText, requestedLength);
 
@@ -594,12 +556,7 @@ async function startMaximus(promptText, lengthOverride) {
   recordedBlob = null;
   downloadBtn.disabled = true;
 
-  if (freeActive) {
-    statusEl.textContent = `Free Pro: generating ~${style.lengthSeconds}s track (${style.genres.join(", ")} @ ${style.bpm} BPM)...`;
-  } else {
-    statusEl.textContent = `Pro (limited): generating ~${style.lengthSeconds}s track (${style.genres.join(", ")} @ ${style.bpm} BPM)...`;
-  }
-
+  statusEl.textContent = `Free Pro: generating ~${style.lengthSeconds}s track (${style.genres.join(", ")} @ ${style.bpm} BPM)...`;
   updatePlanInfo();
 }
 
@@ -620,7 +577,7 @@ downloadBtn.onclick = () => {
 
   const a = document.createElement("a");
   a.href = url;
-  a.download = "maximus-pro.wav";
+  a.download = "maximus-pro-free.wav";
   a.click();
 
   statusEl.textContent = "Render complete. WAV downloaded.";
